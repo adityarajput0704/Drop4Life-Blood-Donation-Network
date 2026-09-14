@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum as SAEnum, ForeignKey, Date, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Enum as SAEnum, ForeignKey, Date, Float, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from backend.database import Base
@@ -21,6 +21,13 @@ class AvailabilityEnum(str, enum.Enum):
 
 class Donor(Base):
     __tablename__ = "donors"
+
+    __table_args__ = (
+        Index("ix_donors_blood_group", "blood_group"),
+        Index("ix_donors_city", "city"),
+        Index("ix_donors_availability", "availability"),
+        Index("ix_donors_is_active", "is_active"),
+    )
 
     id                 = Column(Integer, primary_key=True, index=True)
     user_id            = Column(String, ForeignKey("users.id"), unique=True, nullable=False)

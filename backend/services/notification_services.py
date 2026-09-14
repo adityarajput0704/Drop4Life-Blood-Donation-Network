@@ -1,16 +1,11 @@
 import logging
-import asyncio
-from datetime import datetime
-from sqlalchemy.orm import Session
+from datetime import datetime, date, timedelta
 from backend.models.blood_requests import BloodRequest
-from backend.models.donor import Donor
+from backend.models.donor import Donor, AvailabilityEnum
 from backend.core.websocket_manager import manager
 from backend.dependencies.__init__ import get_db
-from fastapi import Depends
 from backend.services.fcm_service import send_push_notification
 from backend.models.user import User
-from datetime import date, timedelta
-from backend.models.donor import AvailabilityEnum
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +18,13 @@ async def _broadcast(room: str, event: dict):
         logger.error(f"[WS BROADCAST ERROR] room={room} error={e}")
 
 
-def notify_request_created(
+async def notify_request_created(
     request_id: int,
     hospital_name: str,
     blood_group: str,
     urgency: str,
-    db: Session,                     # ← db is passed in from blood_requests.py
 ):
+    db = next(get_db())
     try:
         logger.info(
             f"[REQUEST CREATED] ID={request_id} | "
@@ -48,8 +43,8 @@ def notify_request_created(
             }
         }
 
-        asyncio.run(_broadcast("admin", event))
-        asyncio.run(_broadcast("donors", event))
+        await _broadcast("admin", event)
+        await _broadcast("donors", event)
 
         # ── NEW: Send FCM push to all matching available donors ──
         from backend.models.donor import Donor, BloodGroupEnum, AvailabilityEnum
@@ -59,25 +54,25 @@ def notify_request_created(
 
         # Find all active, available donors with matching blood group
         matching_donors = (
-            db.query(Donor)
-            .join(User, Donor.user_id == User.id)
-            .filter(
-                Donor.blood_group.in_(compatible_donor_blood_groups),
-                Donor.availability == AvailabilityEnum.AVAILABLE,
-                Donor.is_active == True,
-                User.fcm_token != None,       # ← only donors with the Flutter app
-            )
-            .all()
+        db.query(User.fcm_token)
+        .join(Donor, Donor.user_id == User.id)
+        .filter(
+            Donor.blood_group.in_(compatible_donor_blood_groups),
+            Donor.availability == AvailabilityEnum.AVAILABLE,
+            Donor.is_active == True,
+            User.fcm_token != None,
         )
+        .all()
+    )
 
         logger.info(f"[FCM] Found {len(matching_donors)} donors to notify")
 
         urgency_emoji = {"critical": "URGENT", "high": "High Priority", "medium": "Medium", "low": "Low"}
         urgency_label = urgency_emoji.get(urgency.lower(), urgency)
 
-        for donor in matching_donors:
+        for (fcm_token,) in matching_donors:
             send_push_notification(
-                fcm_token=donor.user.fcm_token,
+                fcm_token=fcm_token,
                 title=f"Blood Needed — {blood_group}",
                 body=f"{urgency_label}: {hospital_name} needs {blood_group} blood. Can you help?",
                 data={
@@ -90,10 +85,13 @@ def notify_request_created(
 
     except Exception as e:
         logger.error(f"[REQUEST CREATED ERROR] request_id={request_id} | error={e}")
+    finally:
+        db.close()
 
 
 
-def notify_request_accepted(
+
+async def notify_request_accepted(
     request_id: int,
     hospital_id: int,
     donor_name: str,
@@ -104,6 +102,7 @@ def notify_request_accepted(
     Broadcasts to:
       - hospital_{id} room → hospital sees donor assigned instantly
       - admin room         → admin sees status change
+      - donors room        → donors see request status change
     """
     try:
         logger.info(
@@ -123,20 +122,22 @@ def notify_request_accepted(
             }
         }
 
-        asyncio.run(_broadcast(f"hospital_{hospital_id}", event))
-        asyncio.run(_broadcast("admin", event))
-        asyncio.run(_broadcast("donors", event))  
+        await _broadcast(f"hospital_{hospital_id}", event)
+        await _broadcast("admin", event)
+        await _broadcast("donors", event)
 
     except Exception as e:
-        logger.error(f"[REQUEST ACCEPTED ERROR] request_id={request_id} | error={e}")
+        logger.error(
+            f"[REQUEST ACCEPTED ERROR] "
+            f"request_id={request_id} | error={e}"
+        )
 
-
-def notify_donation_fulfilled(
+async def notify_donation_fulfilled(
     request_id: int,
     donor_id: int,
     hospital_id: int,
-    db: Session,
 ):
+    db = next(get_db())
     try:
         blood_request = db.query(BloodRequest).filter(BloodRequest.id == request_id).first()
         donor = db.query(Donor).filter(Donor.id == donor_id).first()
@@ -167,23 +168,33 @@ def notify_donation_fulfilled(
             }
         }
 
-        asyncio.run(_broadcast("admin", event))
-        asyncio.run(_broadcast(f"hospital_{hospital_id}", event))
+        await _broadcast("admin", event)
+        await _broadcast(f"hospital_{hospital_id}", event)
 
     except Exception as e:
         logger.error(f"[DONATION FULFILLED ERROR] request_id={request_id} | error={e}")
+    finally:
+        db.close()
 
-def _broadcast_availability_change(donor_id: int, full_name: str, availability: str):
+async def _broadcast_availability_change(
+    donor_id: int,
+    full_name: str,
+    availability: str,
+):
     try:
         event = {
             "type": "DONOR_AVAILABILITY_CHANGED",
             "payload": {
-                "donor_id":     donor_id,
-                "full_name":    full_name,
+                "donor_id": donor_id,
+                "full_name": full_name,
                 "availability": availability,
-                "timestamp":    datetime.utcnow().isoformat(),
-            }
+            },
         }
-        asyncio.run(_broadcast("admin", event))
+
+        await _broadcast("admin", event)
+
     except Exception as e:
-        logger.error(f"[AVAILABILITY BROADCAST ERROR] {e}")
+        logger.error(
+            f"[AVAILABILITY CHANGE ERROR] "
+            f"donor_id={donor_id} | error={e}"
+        )

@@ -10,42 +10,67 @@ scheduler = BackgroundScheduler()
 
 def reset_expired_cooldowns():
     """
-    Runs daily. Finds donors whose cooldown_until date has passed
-    and resets their availability to AVAILABLE automatically.
+    Runs daily. Only one FastAPI worker executes the job
+    using a PostgreSQL advisory lock.
     """
     db = next(get_db())
+
     try:
-        today = date.today()
+        # PostgreSQL advisory lock.
+        # Only one worker can hold this lock at a time.
+        lock_acquired = db.execute(
+            "SELECT pg_try_advisory_lock(987654321)"
+        ).scalar()
 
-        expired_donors = (
-            db.query(Donor)
-            .filter(
-                Donor.cooldown_until != None,
-                Donor.cooldown_until < today,
-                Donor.availability == AvailabilityEnum.UNAVAILABLE,
-            )
-            .all()
-        )
-
-        count = len(expired_donors)
-        for donor in expired_donors:
-            donor.availability = AvailabilityEnum.AVAILABLE
+        if not lock_acquired:
             logger.info(
-                f"[COOLDOWN RESET] Donor ID={donor.id} | "
-                f"Cooldown expired on {donor.cooldown_until} | "
-                f"Now AVAILABLE"
+                "[SCHEDULER] Another worker is already running "
+                "the cooldown reset — skipping."
+            )
+            return
+
+        try:
+            today = date.today()
+
+            expired_donors = (
+                db.query(Donor)
+                .filter(
+                    Donor.cooldown_until != None,
+                    Donor.cooldown_until < today,
+                    Donor.availability == AvailabilityEnum.UNAVAILABLE,
+                )
+                .all()
             )
 
-        db.commit()
-        logger.info(f"[SCHEDULER] Cooldown reset complete — {count} donors re-activated")
+            count = len(expired_donors)
+
+            for donor in expired_donors:
+                donor.availability = AvailabilityEnum.AVAILABLE
+                logger.info(
+                    f"[COOLDOWN RESET] Donor ID={donor.id} | "
+                    f"Cooldown expired on {donor.cooldown_until} | "
+                    f"Now AVAILABLE"
+                )
+
+            db.commit()
+
+            logger.info(
+                f"[SCHEDULER] Cooldown reset complete — "
+                f"{count} donors re-activated"
+            )
+
+        finally:
+            db.execute(
+                "SELECT pg_advisory_unlock(987654321)"
+            )
 
     except Exception as e:
         logger.error(f"[SCHEDULER ERROR] {e}")
         db.rollback()
+
     finally:
         db.close()
-
-
+        
 def start_scheduler():
     scheduler.add_job(
         reset_expired_cooldowns,

@@ -1,6 +1,7 @@
+import math
 from dns import query
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request, BackgroundTasks
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import Optional
 from backend.dependencies.__init__ import get_db
 from backend.models.blood_requests import BloodRequest, RequestStatusEnum
@@ -90,7 +91,6 @@ def create_blood_request(
     hospital_name=current_hospital.name,
     blood_group=blood_request.blood_group.value,
     urgency=blood_request.urgency.value,
-    db=db,
 )
 
     return build_request_response(blood_request)
@@ -236,14 +236,39 @@ def get_matching_requests(
         if donor.blood_group.value in compatible_donors
     ]
 
-    requests = (
+    requests_query = (
         db.query(BloodRequest)
-        .filter(
+        .options(joinedload(BloodRequest.hospital))
+        .join(BloodRequest.hospital)
+       .filter(
             BloodRequest.status == RequestStatusEnum.OPEN,
             BloodRequest.blood_group.in_(compatible_recipient_groups),
         )
-        .order_by(BloodRequest.created_at.desc())
-        .all()
+    )
+
+# ── GPS available — use DB bounding box first ──
+    if donor.latitude is not None and donor.longitude is not None:
+        lat_delta = radius_km / 111.0
+    
+        lng_delta = radius_km / (
+            111.0 * math.cos(math.radians(donor.latitude))
+        )
+
+        requests_query = requests_query.filter(
+            Hospital.latitude.between(
+                donor.latitude - lat_delta,
+                donor.latitude + lat_delta,
+            ),
+            Hospital.longitude.between(
+                donor.longitude - lng_delta,
+                donor.longitude + lng_delta,
+            ),
+        )
+
+    requests = (
+       requests_query
+       .order_by(BloodRequest.created_at.desc())
+       .all()
     )
 
     # ── Strategy 1: GPS available — filter by real distance ──
@@ -263,11 +288,17 @@ def get_matching_requests(
 
     # ── Strategy 2: No GPS — filter by donor's city only ──
     else:
-        donor_city = donor.city.strip().lower()
-        requests = [
-            req for req in requests
-            if req.hospital.city.strip().lower() == donor_city
-        ]
+        donor_city = donor.city.strip()
+
+        requests_query = requests_query.filter(
+            Hospital.city.ilike(donor_city)
+        )
+
+        requests = (
+            requests_query
+            .order_by(BloodRequest.created_at.desc())
+            .all()
+        )
 
     return {
         "total": len(requests),
@@ -337,23 +368,25 @@ def accept_blood_request(
 @router.patch("/{request_id}/fulfil", response_model=BloodRequestResponse)
 def fulfil_blood_request(
     request_id: int,
-    hospital_id: int,   # ✅ explicit
     background_tasks: BackgroundTasks,
+    current_hospital: Hospital = Depends(get_current_hospital),
     db: Session = Depends(get_db),
 ):
-    hospital = db.query(Hospital).filter(Hospital.id == hospital_id).first()
-    if not hospital:
-        raise HTTPException(404, "Hospital not found")
+    blood_request = db.query(BloodRequest).filter(
+        BloodRequest.id == request_id
+    ).first()
 
-    blood_request = db.query(BloodRequest).filter(BloodRequest.id == request_id).first()
     if not blood_request:
         raise HTTPException(404, "Blood request not found")
 
-    if blood_request.hospital_id != hospital.id:
+    if blood_request.hospital_id != current_hospital.id:
         raise HTTPException(403, "Not your request")
 
     if blood_request.status != RequestStatusEnum.ACCEPTED:
-        raise HTTPException(409, "Only accepted requests can be fulfilled")
+        raise HTTPException(
+            409,
+            "Only accepted requests can be fulfilled"
+        )
 
     blood_request.status = RequestStatusEnum.FULFILLED
     db.commit()
@@ -365,8 +398,7 @@ def fulfil_blood_request(
         notify_donation_fulfilled,
         request_id=blood_request.id,
         donor_id=blood_request.donor_id,
-        hospital_id=hospital.id,
-        db=db,
+        hospital_id=current_hospital.id,
     )
 
     return build_request_response(blood_request)

@@ -42,14 +42,26 @@ def set_cached(key: str, value: Any, ttl_seconds: int = 60):
 
 def invalidate_cache(pattern: str):
     """
-    Delete all cache keys matching a pattern.
-    Called when data changes so stale cache is cleared.
+    Delete all cache keys matching a pattern without blocking Redis.
 
-    Example: invalidate_cache("donors:*") clears all donor list caches.
+    Uses SCAN instead of KEYS so Redis can continue serving
+    other requests while the keyspace is being searched.
     """
     try:
-        keys = redis_client.keys(pattern)
-        if keys:
-            redis_client.delete(*keys)
+        cursor = 0
+
+        while True:
+            cursor, keys = redis_client.scan(
+                cursor=cursor,
+                match=pattern,
+                count=100,
+            )
+
+            if keys:
+                redis_client.delete(*keys)
+
+            if cursor == 0:
+                break
+
     except Exception:
         pass

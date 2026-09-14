@@ -1,12 +1,16 @@
+import math
+import os
+from warnings import filters
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 from backend.dependencies.__init__ import get_db
 from backend.models.donor import AvailabilityEnum, Donor
 from backend.models.user import User
 from backend.models.blood_requests import BloodRequest
 from backend.schemas.donor import DonorCreate, DonorUpdate, DonorResponse, DonorFilterParams, LocationUpdate
 from backend.dependencies.auth import get_current_user
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from backend.core.pagination import PaginationParams, PagedResponse
 from backend.core.rate_limiter import limiter
 from backend.core.cache import get_cached, set_cached, invalidate_cache
@@ -158,7 +162,9 @@ def update_donor_profile(
     if not donor:
         raise HTTPException(status_code=404, detail="No donor profile found.")
 
-    for field, value in updates.model_dump(exclude_unset=True).items():
+    updates_data = updates.model_dump(exclude_unset=True)
+
+    for field, value in updates_data.items():
         setattr(donor, field, value)
 
     db.commit()
@@ -166,7 +172,7 @@ def update_donor_profile(
     invalidate_cache("donors:*")
 
     # Broadcast availability change to admin room
-    if 'availability' in updates.model_dump(exclude_unset=True):
+    if 'availability' in updates_data:
         background_tasks.add_task(
             _broadcast_availability_change,
             donor_id=donor.id,
@@ -178,7 +184,7 @@ def update_donor_profile(
 
 
 @router.get("/", response_model=PagedResponse[DonorResponse])
-@limiter.limit("30/minute")
+@limiter.limit("30/minute") if not os.getenv("BENCHMARK_MODE") else lambda f: f
 def list_donors(
     request:    Request,
     pagination: PaginationParams = Depends(),
@@ -199,7 +205,13 @@ def list_donors(
         if cached:
             return cached
 
-    query = db.query(Donor).filter(Donor.is_active == True)
+    query = (
+        db.query(Donor)
+        .options(
+            joinedload(Donor.user),
+        )
+        .filter(Donor.is_active == True)
+    )
 
     if filters.blood_group:
         query = query.filter(Donor.blood_group == filters.blood_group)
@@ -217,31 +229,110 @@ def list_donors(
             or_(User.full_name.ilike(search_term), User.phone.ilike(search_term))
         )
 
-    all_donors = query.all()
+    # ── Proximity filter ──
+    if (
+        filters.lat is not None
+        and filters.lng is not None
+        and filters.radius_km is not None
+    ):
+        lat_delta = filters.radius_km / 111.0
+        lng_delta = filters.radius_km / (
+            111.0 * math.cos(math.radians(filters.lat))
+        )
 
-    # ── Proximity filter (Haversine) ──
-    if filters.lat and filters.lng and filters.radius_km:
-        donors_with_distance = []
-        for donor in all_donors:
-            if donor.latitude is None or donor.longitude is None:
-                continue   # skip donors who haven't shared location
-            dist = haversine_distance(
-                filters.lat, filters.lng,
-                donor.latitude, donor.longitude
+        # Cheap bounding-box pre-filter using the composite index
+        query = query.filter(
+        Donor.latitude.between(
+            filters.lat - lat_delta,
+            filters.lat + lat_delta,
+        ),
+        Donor.longitude.between(
+            filters.lng - lng_delta,
+            filters.lng + lng_delta,
+        ),
+    )
+
+        # Calculate Haversine distance inside PostgreSQL
+        lat1 = math.radians(filters.lat)
+        lon1 = math.radians(filters.lng)
+
+        distance = (
+            6371
+            * 2
+           * func.atan2(
+                func.sqrt(
+                   func.pow(
+                       func.sin(
+                            (func.radians(Donor.latitude) - lat1) / 2
+                        ),
+                        2,
+                    )
+                    + func.cos(lat1)
+                    * func.cos(func.radians(Donor.latitude))
+                    * func.pow(
+                        func.sin(
+                            (func.radians(Donor.longitude) - lon1) / 2
+                       ),
+                        2,
+                    )
+                ),
+                func.sqrt(
+                    1
+                    - (
+                        func.pow(
+                            func.sin(
+                                (func.radians(Donor.latitude) - lat1) / 2
+                            ),
+                            2,
+                        )
+                        + func.cos(lat1)
+                        * func.cos(func.radians(Donor.latitude))
+                        * func.pow(
+                            func.sin(
+                                (func.radians(Donor.longitude) - lon1) / 2
+                            ),
+                            2,
+                        )
+                    )
+                ),
             )
-            if dist <= filters.radius_km:
-                donors_with_distance.append((donor, dist))
+        ).label("distance_km")
 
-        # Sort by distance — closest first
-        donors_with_distance.sort(key=lambda x: x[1])
+        query = (
+           query
+            .add_columns(distance)
+            .filter(distance <= filters.radius_km)
+            .order_by(distance)
+        )
 
-        total = len(donors_with_distance)
-        paginated = donors_with_distance[pagination.offset: pagination.offset + pagination.page_size]
-        items = [build_donor_response(d, dist) for d, dist in paginated]
+        total = query.count()
+
+        paginated = (
+           query
+           .offset(pagination.offset)
+            .limit(pagination.page_size)
+            .all()
+        )
+
+        items = [
+           build_donor_response(donor, distance)
+           for donor, distance in paginated
+       ]
+
     else:
-        total = len(all_donors)
-        paginated = all_donors[pagination.offset: pagination.offset + pagination.page_size]
-        items = [build_donor_response(d) for d in paginated]
+        total = query.count()
+
+        paginated = (
+            query
+            .offset(pagination.offset)
+            .limit(pagination.page_size)
+            .all()
+        )
+
+        items = [
+            build_donor_response(donor)
+            for donor in paginated
+        ]
 
     result = PagedResponse.create(items=items, total=total, params=pagination)
 
